@@ -50,10 +50,27 @@ class Conn:
     read_paused: bool = False
     eof: bool = False
     closed: bool = False
+    # 对端地址（值班员按 对端IP:端口 选连接）
+    peer_ip: str = ""
+    peer_port: int = 0
+    # 连接级单调字节坐标（跨换版随快照连续传递）：
+    # gen_total     —— 已生成的回执字节总数
+    # handed_total  —— 已成功 send() 给本机 TCP 的字节总数
+    gen_total: int = 0
+    handed_total: int = 0
+    # 本连接上的追踪轮次（只保留当前一轮）；trace_limit=0 表示未在追踪。
+    # 注意：追踪不随换版移交给新进程——成功移交时由 supervisor 结算本轮；
+    # 换版失败 RESUME 后旧进程继续使用这里的状态。
+    trace_limit: int = 0
+    trace_items: list[dict] = field(default_factory=list)
 
     @property
     def fd(self) -> int:
         return self.sock.fileno()
+
+    @property
+    def peer_key(self) -> tuple[str, int]:
+        return self.peer_ip, self.peer_port
 
     def mask(self) -> int:
         if self.closed:
@@ -93,6 +110,8 @@ class Worker:
         self.listen_sock = listen_sock
         self.poller = select.poll()
         self.conns: dict[int, Conn] = {}
+        # (peer_ip, peer_port) -> Conn，TRACE_ARM 时 O(1) 定位，不扫描积压
+        self.by_peer: dict[tuple[str, int], Conn] = {}
         self.frozen = False
         self.poller.register(self.control.fileno(), select.POLLIN)
         self.poller.register(self.listen_sock.fileno(), select.POLLIN)
@@ -111,11 +130,12 @@ class Worker:
         if events & (select.POLLERR | select.POLLHUP) and not (
             events & select.POLLIN
         ):
-            # 无数据可读且对端挂断/出错：尽力发完缓冲后关闭
+            # 无数据可读且对端挂断/出错：尽力刷一次缓冲后关闭，
+            # 由 _reap 统一 close 并上报 CONN_CLOSE 结算追踪轮次。
             if fd in self.conns:
                 conn = self.conns[fd]
-                if not self._flush_send(conn):
-                    conn.closed = True
+                self._flush_send(conn)
+                conn.closed = True
             return
         if fd == self.listen_sock.fileno():
             self._on_accept()
@@ -141,8 +161,78 @@ class Worker:
             os._exit(0)
         if kind == "SNAPSHOT":
             self._handle_snapshot()
+        elif kind == "TRACE_ARM":
+            self._handle_trace_arm(msg)
         else:
             self._log(f"unknown control message: {msg!r}")
+
+    # ---------------- 追踪 ----------------
+    def _emit_control(self, payload: dict, fd: int | None = None) -> bool:
+        """正常服务期向 supervisor 异步上报事件；非阻塞、尽力而为。
+
+        绝不能因为控制通道写不进而拖住探头 socket 的关闭/收发。
+        """
+        try:
+            send_fd(self.control, payload, fd)
+            return True
+        except (OSError, ConnectionError) as exc:
+            self._log(f"control event dropped: {payload.get('type')} {exc!r}")
+            return False
+
+    def _handle_trace_arm(self, msg: dict) -> None:
+        arm_id = msg.get("arm_id")
+        peer_ip = str(msg.get("peer_ip", ""))
+        peer_port = int(msg.get("peer_port", 0))
+        limit = int(msg.get("limit", 0))
+        conn = self.by_peer.get((peer_ip, peer_port))
+        if conn is None or conn.closed:
+            self._emit_control(
+                {"type": "TRACE_ARMED", "arm_id": arm_id, "ok": False,
+                 "error": "no such online connection",
+                 "peer_ip": peer_ip, "peer_port": peer_port}
+            )
+            return
+        # O(1) 重置为本轮；不触碰/扫描 recv_buf、send_buf、pending 旧积压。
+        conn.trace_limit = limit
+        conn.trace_items = []
+        self._log(f"trace armed peer={peer_ip}:{peer_port} limit={limit} "
+                  f"gen_total={conn.gen_total}")
+        # 随回执把连接 fd 经 SCM_RIGHTS 复制给 supervisor；
+        # 发送的是 conn.fd 本身，内核在接收方产生新 dup，本进程所有权不变。
+        self._emit_control(
+            {"type": "TRACE_ARMED", "arm_id": arm_id, "ok": True,
+             "peer_ip": peer_ip, "peer_port": peer_port,
+             "limit": limit, "pid": os.getpid(), "revision": self.revision,
+             "gen_total": conn.gen_total, "handed_total": conn.handed_total},
+            conn.fd,
+        )
+
+    def _record_trace_item(
+        self, conn: Conn, value: int, reply: bytes, revision: int, start_abs: int
+    ) -> None:
+        """回执生成时记账；只保留本轮选定的至多 trace_limit 条。"""
+        if conn.trace_limit <= 0:
+            return
+        if len(conn.trace_items) >= conn.trace_limit:
+            return
+        item = {
+            "index": len(conn.trace_items) + 1,
+            "value": value,
+            "revision": revision,
+            "length": len(reply),
+            "start_abs": start_abs,
+            "end_abs": start_abs + len(reply),
+            "handed_total": conn.handed_total,
+        }
+        conn.trace_items.append(item)
+        # 快照冻结期间不能在 SNAPSHOT_STATE 之前插入控制消息；
+        # 这些记录会随快照状态交给 supervisor。
+        if not self.frozen:
+            self._emit_control(
+                {"type": "TRACE_ITEM",
+                 "peer_ip": conn.peer_ip, "peer_port": conn.peer_port,
+                 "item": item}
+            )
 
     def _handle_snapshot(self) -> None:
         # 冻结：先停 accept，再逐连接停 poll 并排空内核中已到达的数据。
@@ -172,6 +262,17 @@ class Worker:
                     ],
                     "eof": conn.eof,
                     "paused": conn.read_paused,
+                    # 对端与字节坐标（供 supervisor 注册表/追踪判定连续）
+                    "peer_ip": conn.peer_ip,
+                    "peer_port": conn.peer_port,
+                    "gen_total": conn.gen_total,
+                    "handed_total": conn.handed_total,
+                    # 仅作信息随快照上报；新进程不恢复追踪配置
+                    "trace": (
+                        {"limit": conn.trace_limit, "items": conn.trace_items}
+                        if conn.trace_limit > 0
+                        else None
+                    ),
                 }
             )
         send_fd(self.control, {"type": "SNAPSHOT_STATE", "n": len(live),
@@ -218,10 +319,28 @@ class Worker:
             except BlockingIOError:
                 return
             sock.setblocking(False)
-            conn = Conn(sock=sock)
+            # 测试钩子：把服务端发送缓冲压到很小，以确定性构造“待发”状态。
+            # 仅当设置 WORKER_TEST_SNDBUF 时生效，默认行为不变。
+            test_sndbuf = os.environ.get("WORKER_TEST_SNDBUF")
+            if test_sndbuf:
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF,
+                                    int(test_sndbuf))
+                except (ValueError, OSError):
+                    pass
+            peer_ip = addr[0]
+            if peer_ip.startswith("::ffff:"):
+                peer_ip = peer_ip[len("::ffff:"):]
+            conn = Conn(sock=sock, peer_ip=peer_ip, peer_port=int(addr[1]))
             self.conns[conn.fd] = conn
+            self.by_peer[conn.peer_key] = conn
             self.poller.register(conn.fd, select.POLLIN)
             self._log(f"accepted fd={conn.fd} addr={addr}")
+            self._emit_control(
+                {"type": "CONN_OPEN",
+                 "peer_ip": conn.peer_ip, "peer_port": conn.peer_port,
+                 "pid": os.getpid()}
+            )
 
     # ---------------- 连接读写 ----------------
     def _on_conn(self, conn: Conn, events: int) -> None:
@@ -286,6 +405,11 @@ class Worker:
             if len(reply) > MAX_BUFFER:
                 self._log(f"fd={conn.fd} reply exceeds buffer cap, dropped")
                 continue
+            # 回执“生成”即占用连接字节流中的一段连续绝对坐标
+            start_abs = conn.gen_total
+            conn.gen_total += len(reply)
+            self._record_trace_item(conn, value + self.offset, reply,
+                                    self.revision, start_abs)
             if len(reply) > MAX_BUFFER - len(conn.send_buf):
                 conn.pending.append((reply, self.revision))  # FIFO，记下版号
                 continue
@@ -319,6 +443,8 @@ class Worker:
             if sent <= 0:
                 break
             del buf[:sent]
+            # 这些字节已被本机 TCP 接受（“全部交给本机 TCP”的判定依据之一）
+            conn.handed_total += sent
         self._drain_pending(conn)
         if conn.read_paused and len(conn.recv_buf) < MAX_BUFFER:
             conn.read_paused = False
@@ -329,6 +455,8 @@ class Worker:
     def load_state(self, state: dict, conn_socks: list[socket.socket]) -> None:
         for sock, item in zip(conn_socks, state.get("conns", [])):
             sock.setblocking(False)
+            peer_ip = str(item.get("peer_ip", ""))
+            peer_port = int(item.get("peer_port", 0) or 0)
             conn = Conn(
                 sock=sock,
                 recv_buf=bytearray(base64.b64decode(item["recv"])),
@@ -339,11 +467,19 @@ class Worker:
                 ],
                 eof=bool(item.get("eof")),
                 read_paused=bool(item.get("paused")),
+                peer_ip=peer_ip,
+                peer_port=peer_port,
+                gen_total=int(item.get("gen_total", 0) or 0),
+                handed_total=int(item.get("handed_total", 0) or 0),
+                # 刻意不恢复 trace_limit/trace_items：成功移交后由
+                # supervisor 结算上一轮；新进程从“无追踪”开始。
             )
             # 缓冲上限不变量校验，防御异常快照
             if len(conn.recv_buf) > MAX_BUFFER or len(conn.send_buf) > MAX_BUFFER:
                 raise ValueError("inherited state exceeds buffer cap")
             self.conns[conn.fd] = conn
+            if peer_ip and peer_port:
+                self.by_peer[conn.peer_key] = conn
             self.poller.register(conn.fd, conn.mask())
 
     def snapshot_fds(self) -> list[int]:
@@ -373,13 +509,29 @@ class Worker:
             pass
 
     def _reap(self) -> None:
-        for conn in [c for c in self.conns.values() if c.closed]:
+        dead = [c for c in list(self.conns.values()) if c.closed]
+        if not dead:
+            return
+        closed_events: list[dict] = []
+        # 第一遍：摘除 poll 并立即关闭 socket。追踪事件上报放在关闭之后，
+        # 且控制通道非阻塞，因此追踪/上报都不会推迟探头套接字的关闭。
+        for conn in dead:
             self._poll_unregister(conn.fd)
             try:
                 conn.sock.close()
             except OSError:
                 pass
             self.conns.pop(conn.fd, None)
+            self.by_peer.pop(conn.peer_key, None)
+            if conn.peer_ip and conn.peer_port:
+                closed_events.append(
+                    {"type": "CONN_CLOSE",
+                     "peer_ip": conn.peer_ip, "peer_port": conn.peer_port,
+                     "pid": os.getpid(), "traced": conn.trace_limit > 0}
+                )
+        # 第二遍：尽力通知 supervisor 结算本轮（失败也不影响关闭）
+        for event in closed_events:
+            self._emit_control(event)
 
     def _log(self, msg: str) -> None:
         sys.stderr.write(

@@ -33,7 +33,7 @@ def free_port() -> int:
 
 
 class Server:
-    def __init__(self) -> None:
+    def __init__(self, extra_env: dict[str, str] | None = None) -> None:
         self.http_port = free_port()
         self.tcp_port = free_port()
         env = dict(os.environ)
@@ -41,6 +41,8 @@ class Server:
         env["TCP_PORT"] = str(self.tcp_port)
         env["WORKER_FAIL_MARKER"] = str(FAIL_MARKER)
         env["PYTHONUNBUFFERED"] = "1"
+        if extra_env:
+            env.update(extra_env)
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "app.main"],
             cwd=ROOT,
