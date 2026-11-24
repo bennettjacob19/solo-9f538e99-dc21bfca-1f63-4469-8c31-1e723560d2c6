@@ -1,0 +1,15 @@
+services:
+  temp-correction:
+    build: .
+    image: temp-correction:latest
+    ports:
+      - "8000:8000"   # FastAPI /docs 与管理接口
+      - "9000:9000"   # 探头 TCP 长连接
+    environment:
+      TCP_HOST: "0.0.0.0"
+      TCP_PORT: "9000"
+      HTTP_HOST: "0.0.0.0"
+      HTTP_PORT: "8000"
+      INITIAL_OFFSET: "0"
+    restart: unless-stopped
+    init: true
